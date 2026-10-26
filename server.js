@@ -1,6 +1,6 @@
 /* server.js - the free-hosted bridge between your phone and Z.ai.
  *
- *   GET  /        -> the phone voice page (browser mic + speaker)
+ *   GET  /        -> the phone voice page (Puter does STT + TTS)
  *   GET  /status  -> {"status":"awake","uptime_s":N,"history_turns":N}
  *                    (the ESP32's 'pingserver' reads exactly this)
  *   POST /chat    -> {"text":"hello"} -> {"reply":"..."} (with memory)
@@ -97,15 +97,20 @@ app.post("/chat", async (req, res) => {
   }
 });
 
-/* The phone voice page. The browser's Web Speech API does STT (the
- * mic) and TTS (the speaker) - no app, no Home Assistant. It needs
- * HTTPS, which the free host provides out of the box. */
+/* The phone voice page. Puter (puter.js - keyless, "user pays")
+ * does both voices: a MediaRecorder mic capture goes to
+ * puter.ai.speech2txt (STT) and the reply is spoken by
+ * puter.ai.txt2speech (TTS). The browser's built-in Web Speech
+ * API stays as a silent fallback if puter.js is unreachable or
+ * sign-in is skipped. Needs HTTPS, which the free host provides
+ * out of the box. */
 const VOICE_PAGE = `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ESP32 Voice Bridge</title>
+<script src="https://js.puter.com/v2/"></script>
 <style>
  body{font-family:system-ui;margin:0;min-height:100vh;display:flex;
       flex-direction:column;align-items:center;justify-content:center;
@@ -129,19 +134,37 @@ const VOICE_PAGE = `<!doctype html>
  <div id="transcript"></div>
  <div id="reply"></div>
  <button id="reset">Reset memory</button>
- <small>mic + speaker: your browser (Web Speech API)<br>
+ <small>mic + speaker: Puter (puter.js) - keyless, one free sign-in<br>
   brain: glm-4.7-flash, thinking off - memory: 10-min timeout</small>
 <script>
- var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
  var mic = document.getElementById("mic");
  var statusEl = document.getElementById("status");
  var transEl = document.getElementById("transcript");
  var replyEl = document.getElementById("reply");
- function speak(t) {
+ var havePuter = typeof puter !== "undefined" && !!puter.ai &&
+                 !!puter.ai.speech2txt && !!puter.ai.txt2speech;
+ var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+ var mode = null, listening = false;
+ var rec = null, recorder = null, chunks = [], stream = null, stopTimer = null;
+ function setBusy(b) { mic.classList.toggle("listening", b); }
+ function speakFallback(t) {
    try {
      var u = new SpeechSynthesisUtterance(t);
      speechSynthesis.speak(u);
    } catch (e) {}
+ }
+ function speak(t) {
+   if (!havePuter) { speakFallback(t); return; }
+   puter.ai.txt2speech(t).then(function (audio) {
+     var p = audio.play();
+     if (p && p.catch) p.catch(function () {
+       statusEl.textContent = "Tap anywhere to hear the reply.";
+       document.body.onclick = function () {
+         document.body.onclick = null;
+         try { audio.play(); } catch (e) {}
+       };
+     });
+   }).catch(function () { speakFallback(t); });
  }
  function ask(text) {
    statusEl.textContent = "Thinking...";
@@ -164,33 +187,109 @@ const VOICE_PAGE = `<!doctype html>
        statusEl.textContent = "Network error: " + e;
      });
  }
- if (!SR) {
-   statusEl.textContent =
-     "This browser has no SpeechRecognition - use Chrome " +
-     "(Android/desktop) or Safari on iOS 14.5+.";
- } else {
-   var rec = new SR();
-   rec.lang = "en-US";
-   rec.interimResults = false;
-   rec.maxAlternatives = 1;
-   rec.onstart = function () {
-     mic.classList.add("listening");
-     statusEl.textContent = "Listening...";
-   };
-   rec.onresult = function (e) {
-     var text = e.results[0][0].transcript;
+ /* STT path 1 - Puter: MediaRecorder captures the mic, puter.ai
+    speech2txt transcribes the blob (a real model, not the
+    browser's built-in one - and it works on iOS Safari). */
+ function startRec() {
+   navigator.mediaDevices.getUserMedia({ audio: true }).then(function (s) {
+     stream = s;
+     chunks = [];
+     recorder = new MediaRecorder(s);
+     recorder.ondataavailable = function (e) {
+       if (e.data && e.data.size) chunks.push(e.data);
+     };
+     recorder.onstop = sendAudio;
+     recorder.start();
+     listening = true;
+     setBusy(true);
+     statusEl.textContent = "Listening... tap again to send.";
+     stopTimer = setTimeout(stopRec, 15000);
+   }).catch(function (e) {
+     statusEl.textContent = "Mic blocked: " + e + (SR ? " - using browser STT." : "");
+     if (SR) startSR();
+   });
+ }
+ function stopRec() {
+   clearTimeout(stopTimer);
+   if (recorder && recorder.state === "recording") recorder.stop();
+   else { listening = false; setBusy(false); }
+ }
+ function sendAudio() {
+   listening = false;
+   setBusy(false);
+   if (stream) {
+     stream.getTracks().forEach(function (t) { t.stop(); });
+     stream = null;
+   }
+   if (!chunks.length) { statusEl.textContent = "Nothing recorded."; return; }
+   var blob = new Blob(chunks, { type: recorder.mimeType || "audio/webm" });
+   var ext = blob.type.indexOf("mp4") >= 0 ? "mp4" : "webm";
+   var file = new File([blob], "speech." + ext, { type: blob.type });
+   statusEl.textContent = "Transcribing with Puter...";
+   puter.ai.speech2txt(file).then(function (t) {
+     var text = (t && t.text) ? t.text : String(t);
      transEl.textContent = "You: " + text;
      ask(text);
-   };
-   rec.onerror = function (e) {
-     statusEl.textContent = "Mic error: " + e.error;
-   };
-   rec.onend = function () { mic.classList.remove("listening"); };
+   }).catch(function (e) {
+     statusEl.textContent = "Puter STT error: " + ((e && e.message) || e) +
+       " - tap to retry.";
+   });
+ }
+ /* STT path 2 - the browser's Web Speech API, used only when
+    puter.js did not load or the sign-in was skipped. */
+ function startSR() {
+   if (!rec) {
+     rec = new SR();
+     rec.lang = "en-US";
+     rec.interimResults = false;
+     rec.maxAlternatives = 1;
+     rec.onstart = function () {
+       listening = true;
+       setBusy(true);
+       statusEl.textContent = "Listening (browser STT)...";
+     };
+     rec.onresult = function (e) {
+       var text = e.results[0][0].transcript;
+       transEl.textContent = "You: " + text;
+       ask(text);
+     };
+     rec.onerror = function (e) {
+       statusEl.textContent = "Mic error: " + e.error;
+     };
+     rec.onend = function () { listening = false; setBusy(false); };
+   }
+   try { rec.start(); } catch (e) {}
+ }
+ /* One mic button, two engines. The first-ever tap opens ONE free
+    Puter sign-in (the User-Pays model - no API keys anywhere). */
+ if (!havePuter && !SR) {
+   statusEl.textContent = "No Puter and no SpeechRecognition - " +
+     "open this page online in a normal browser.";
+ } else {
    mic.onclick = function () {
-     try { rec.start(); } catch (e) {}
+     if (listening) {
+       if (mode === "puter") stopRec();
+       else { try { rec.stop(); } catch (e) {} }
+       return;
+     }
+     mode = havePuter ? "puter" : "sr";
+     if (mode === "sr") { startSR(); return; }
+     var signed = false;
+     try { signed = puter.auth.isSignedIn(); } catch (e) { signed = false; }
+     if (signed) { startRec(); return; }
+     statusEl.textContent = "One-time Puter sign-in (free)...";
+     puter.auth.signIn().then(function () {
+       startRec();
+     }).catch(function () {
+       statusEl.textContent = "Sign-in skipped - using browser STT.";
+       mode = SR ? "sr" : null;
+       if (mode) startSR();
+       else statusEl.textContent = "Sign-in skipped and no browser STT - reload online.";
+     });
    };
  }
- document.getElementById("reset").onclick = function () {
+ var resetBtn = document.getElementById("reset");
+ resetBtn.onclick = function () {
    fetch("/reset", { method: "POST" }).then(function () {
      transEl.textContent = "";
      replyEl.textContent = "";
